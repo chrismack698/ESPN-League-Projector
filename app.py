@@ -629,6 +629,12 @@ def add_projection_stats(roster_matched: pd.DataFrame, bat: pd.DataFrame, pit: p
     sv = pd.to_numeric(pit_copy.get("SV", 0), errors="coerce").fillna(0)
     hld = pd.to_numeric(pit_copy.get("HLD", pit_copy.get("HD", 0)), errors="coerce").fillna(0)
     pit_copy["SVHD"] = 2 * sv + hld
+
+    # Derive K/BB for pitchers
+    p_k = pd.to_numeric(pit_copy.get("K", pit_copy.get("SO", 0)), errors="coerce").fillna(0)
+    p_bb = pd.to_numeric(pit_copy.get("BB", 0), errors="coerce").fillna(0)
+    pit_copy["K/BB"] = np.where(p_bb > 0, p_k / p_bb, np.nan)
+
     pit_idx = pit_copy.set_index("__CleanName", drop=False)
     
     out_rows = []
@@ -785,12 +791,17 @@ def team_totals_from_lineup(
     p_ER = _num_col(lineup_pit, "ER", default=0.0).sum()
     p_H = _num_col(lineup_pit, "H", default=0.0).sum()
     p_BB = _num_col(lineup_pit, "BB", default=0.0).sum()
+    p_K = _num_col(lineup_pit, "K", default=0.0).sum()
+    if p_K == 0.0:
+        p_K = _num_col(lineup_pit, "SO", default=0.0).sum()
     
     for c in pit_cats:
         if c == "ERA":
             out[c] = float((p_ER * 9) / p_IP) if p_IP > 0 else np.nan
         elif c == "WHIP":
             out[c] = float((p_H + p_BB) / p_IP) if p_IP > 0 else np.nan
+        elif c == "K/BB":
+            out[c] = float(p_K / p_BB) if p_BB > 0 else np.nan
         else:
             out[c] = float(_num_col(lineup_pit, c, default=0.0).sum())
     
@@ -1101,6 +1112,7 @@ _CAT_TO_STAT_COLS: Dict[str, List[str]] = {
     "SVHD": ["SVHD", "SV", "HLD", "HD"],
     "IP": ["IP"],
     "GS": ["GS"],
+    "K/BB": ["K/BB"],
 }
 
 # Categories where *lower* is better
@@ -1233,7 +1245,7 @@ def format_standings_table(df: pd.DataFrame, hit_cats: List[str], pit_cats: List
     
     for col in hit_cats + pit_cats + ["Team_Score"]:
         if col in display_df.columns:
-            if col in ["OBP", "SLG", "OPS", "AVG", "ERA", "WHIP"]:
+            if col in ["OBP", "SLG", "OPS", "AVG", "ERA", "WHIP", "K/BB"]:
                 display_df[col] = display_df[col].round(3)
             elif col == "Team_Score":
                 display_df[col] = display_df[col].round(2)
@@ -1342,7 +1354,7 @@ def main():
         
         with st.expander("⚾ PITCHING", expanded=True):
             default_pit_cats = ["W", "K", "QS", "ERA", "WHIP", "SV", "HLD"]
-            extra_pit_cats = ["GS", "BB", "HR", "K/9", "BB/9",  "SVHD"]
+            extra_pit_cats = ["IP", "GS", "BB", "HR", "K/9", "BB/9", "K/BB", "SVHD"]
             pit_cats = st.multiselect(
                 "Pitching categories",
                 options=default_pit_cats + extra_pit_cats,
@@ -2282,7 +2294,7 @@ def main():
             st.caption(f"Showing {len(fa_display)} of {len(free_agents)} available free agents")
     
     # Debug info
-    with st.expander("League Info"):
+    with st.expander("🔧 Debug Info"):
         st.write("**ESPN League ID:**", league_id)
         st.write("**Season:**", season_year)
         st.write("**Projection Systems:**", f"{hitting_proj} (Hitting), {pitching_proj} (Pitching)")
@@ -2293,7 +2305,6 @@ def main():
         st.write("**Players per team:**")
         team_counts = roster.groupby("Team").size().to_dict()
         st.write(team_counts)
-
 
 
 if __name__ == "__main__":
