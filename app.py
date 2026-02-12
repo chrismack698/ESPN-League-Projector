@@ -438,16 +438,34 @@ def _clean_name(name: str) -> str:
     return n
 
 
+def _name_col(df: pd.DataFrame) -> str:
+    """Return the best name column for a projection DataFrame, safely."""
+    if "Name" in df.columns:
+        return "Name"
+    if "PlayerName" in df.columns:
+        return "PlayerName"
+    if len(df.columns) > 0:
+        return df.columns[0]
+    return "__missing__"
+
+
 def build_projection_index(bat_df: pd.DataFrame, pit_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Build projection DataFrames with clean name index."""
     bat = bat_df.copy()
     pit = pit_df.copy()
     
-    name_col_bat = "Name" if "Name" in bat.columns else "PlayerName" if "PlayerName" in bat.columns else bat.columns[0]
-    name_col_pit = "Name" if "Name" in pit.columns else "PlayerName" if "PlayerName" in pit.columns else pit.columns[0]
+    name_col_bat = _name_col(bat)
+    name_col_pit = _name_col(pit)
     
-    bat["__CleanName"] = bat[name_col_bat].astype(str).apply(_clean_name)
-    pit["__CleanName"] = pit[name_col_pit].astype(str).apply(_clean_name)
+    if name_col_bat != "__missing__":
+        bat["__CleanName"] = bat[name_col_bat].astype(str).apply(_clean_name)
+    else:
+        bat["__CleanName"] = pd.Series(dtype=str)
+
+    if name_col_pit != "__missing__":
+        pit["__CleanName"] = pit[name_col_pit].astype(str).apply(_clean_name)
+    else:
+        pit["__CleanName"] = pd.Series(dtype=str)
     
     return bat, pit
 
@@ -536,8 +554,8 @@ def get_near_matches(
     results = []
 
     # Determine name columns
-    bat_name_col = "Name" if "Name" in bat.columns else "PlayerName" if "PlayerName" in bat.columns else bat.columns[0]
-    pit_name_col = "Name" if "Name" in pit.columns else "PlayerName" if "PlayerName" in pit.columns else pit.columns[0]
+    bat_name_col = _name_col(bat)
+    pit_name_col = _name_col(pit)
 
     # Build lookup: clean_name -> display_name
     bat_display = {}
@@ -1511,6 +1529,76 @@ def main():
     
     # Add projection stats
     joined = add_projection_stats(roster_matched, bat, pit)
+
+    # ------------------------------------------------------------------
+    # Two-way player handling (e.g. Shohei Ohtani)
+    # A player flagged IsPitcher who ALSO exists in the batting projections
+    # gets a duplicate "Hitter" row so the optimizer can slot them into a
+    # UTIL/DH spot for their bat while keeping the pitcher copy for SP/P.
+    # ------------------------------------------------------------------
+    bat_clean_names = set(bat["__CleanName"].dropna().unique()) if "__CleanName" in bat.columns else set()
+    two_way_rows = []
+    for idx, row in joined.iterrows():
+        if row.get("Use_As") != "Pitcher":
+            continue
+        clean = _clean_name(str(row.get("Player", "")))
+        # Check if this pitcher also has batting projections
+        if clean not in bat_clean_names:
+            # Try the matched name too (in case of fuzzy match)
+            matched = str(row.get("Matched_Name", ""))
+            if not matched or matched not in bat_clean_names:
+                continue
+            clean = matched
+
+        # Look up their batting projection row
+        bat_match = bat[bat["__CleanName"] == clean]
+        if bat_match.empty:
+            continue
+
+        fg_bat = bat_match.iloc[0]
+        # Only create the hitter copy if they have meaningful PA
+        pa = pd.to_numeric(fg_bat.get("PA", 0), errors="coerce")
+        if pd.isna(pa) or pa < 50:
+            continue
+
+        # Build the hitter duplicate
+        hitter_row = row.copy()
+        hitter_row["Use_As"] = "Hitter"
+        hitter_row["IsPitcher"] = False
+        hitter_row["Matched_Type"] = "Hitter"
+        hitter_row["_TwoWay"] = True
+        # Ensure UTIL/DH eligibility even if their ESPN position string is all pitching
+        existing_pos = str(hitter_row.get("Position", ""))
+        if "DH" not in existing_pos and "UTIL" not in existing_pos:
+            hitter_row["Position"] = existing_pos + ",DH" if existing_pos else "DH"
+
+        # Overlay batting projection stats onto the hitter copy
+        bat_name_col = _name_col(bat)
+        fg_dict = fg_bat.to_dict()
+        if "Team" in fg_dict:
+            fg_dict["MLB_Team"] = fg_dict.pop("Team")
+        if "Name" in fg_dict:
+            fg_dict["FG_Name"] = fg_dict.pop("Name")
+        # Only copy stats that aren't already roster metadata
+        roster_keys = {"Team", "TeamID", "Player", "ESPN_ID", "Position",
+                       "LineupSlot", "IsPitcher", "Use_As", "Matched_Name",
+                       "Matched_Type", "Match_Score", "__CleanName",
+                       "__CleanMatched", "_TwoWay"}
+        for k, v in fg_dict.items():
+            if k not in roster_keys:
+                hitter_row[k] = v
+
+        two_way_rows.append(hitter_row)
+
+    if two_way_rows:
+        two_way_df = pd.DataFrame(two_way_rows)
+        joined = pd.concat([joined, two_way_df], ignore_index=True)
+        # Mark original pitcher rows so we can identify them later
+        if "_TwoWay" not in joined.columns:
+            joined["_TwoWay"] = False
+        joined["_TwoWay"] = joined["_TwoWay"].fillna(False)
+    else:
+        joined["_TwoWay"] = False
     
     # Build pools
     hit_pool = joined[joined["Use_As"] == "Hitter"].copy()
@@ -1535,17 +1623,20 @@ def main():
     scored = pd.concat([hit_pool, pit_pool], ignore_index=True)
     scored["Value"] = pd.to_numeric(scored["Value"], errors="coerce").fillna(0.0)
     
-    # Summary metrics
+    # Summary metrics (exclude two-way duplicates from player count)
     teams = sorted(scored["Team"].dropna().unique().tolist())
-    matched_ok = scored["Matched_Name"].astype(str).str.len() > 0
-    low_conf = _num_col(scored, "Match_Score", default=0.0) < float(match_threshold)
+    unique_players = scored[~scored.get("_TwoWay", False).astype(bool)] if "_TwoWay" in scored.columns else scored
+    matched_ok = unique_players["Matched_Name"].astype(str).str.len() > 0
+    low_conf = _num_col(unique_players, "Match_Score", default=0.0) < float(match_threshold)
     
+    n_two_way = int(scored["_TwoWay"].sum()) if "_TwoWay" in scored.columns else 0
+
     st.markdown(f"## 📊 {league_name}")
     st.caption(f"Season {season_year} • Projections: {hitting_proj} (Hitting) • {pitching_proj} (Pitching)")
     
     col1, col2, col3, col4 = st.columns(4)
     col1.metric("Teams", len(teams))
-    col2.metric("Total Players", len(scored))
+    col2.metric("Total Players", len(unique_players), delta=f"+{n_two_way} two-way" if n_two_way else None)
     col3.metric("Matched", int(matched_ok.sum()))
     col4.metric("Unmatched", int((~matched_ok | low_conf).sum()))
     
@@ -1806,12 +1897,18 @@ def main():
                 pinned_players = {
                     k[1] for k, v in st.session_state["lineup_overrides"].items() if k[0] == team_pick
                 }
+                two_way_players = set(
+                    hitters_df.loc[hitters_df.get("_TwoWay", pd.Series(False, index=hitters_df.index)).astype(bool), "Player"].tolist()
+                ) if "_TwoWay" in hitters_df.columns else set()
 
                 st.markdown("**Starting Lineup**")
                 if not starters.empty:
                     def _highlight_pinned(row):
-                        if row.get("Player", "") in pinned_players:
+                        player = row.get("Player", "")
+                        if player in pinned_players:
                             return ["background-color: #fff3cd"] * len(row)
+                        if player in two_way_players:
+                            return ["background-color: #d1ecf1"] * len(row)
                         return [""] * len(row)
                     st.dataframe(
                         starters[display_cols].round(3).style.apply(_highlight_pinned, axis=1),
@@ -1853,8 +1950,13 @@ def main():
                         use_container_width=True, height=250,
                     )
 
+            legends = []
             if pinned_players:
-                st.caption("📌 Yellow-highlighted rows have manually overridden slot assignments.")
+                legends.append("📌 Yellow = manually overridden slot")
+            if two_way_players:
+                legends.append("⚾🎯 Blue = two-way player (hitting copy)")
+            if legends:
+                st.caption(" · ".join(legends))
 
     with tab3:
         st.markdown("### 🔀 Trade Matchmaker")
@@ -2242,7 +2344,7 @@ def main():
         all_proj = pd.concat([bat_df, pit_df], ignore_index=True)
         
         # Add clean name
-        name_col = "Name" if "Name" in all_proj.columns else "PlayerName" if "PlayerName" in all_proj.columns else all_proj.columns[0]
+        name_col = _name_col(all_proj)
         all_proj["__CleanName"] = all_proj[name_col].astype(str).apply(_clean_name)
         
         # Filter to free agents
