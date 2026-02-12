@@ -2517,7 +2517,7 @@ def main():
             st.caption(f"Showing {len(fa_display)} of {len(free_agents)} available free agents")
     
     # Debug info
-    with st.expander("🔧 Debug Info"):
+    with st.expander("League Info"):
         st.write("**ESPN League ID:**", league_id)
         st.write("**Season:**", season_year)
         st.write("**Projection Systems:**", f"{hitting_proj} (Hitting), {pitching_proj} (Pitching)")
