@@ -629,7 +629,7 @@ def add_projection_stats(roster_matched: pd.DataFrame, bat: pd.DataFrame, pit: p
     r["__CleanMatched"] = r["Matched_Name"].astype(str).map(_clean_name)
     bat_copy = bat.copy()
     
-    # Derive TB for hitters if not present
+    # Derive TB for hitters if not already present
     if "TB" not in bat_copy.columns:
         h = pd.to_numeric(bat_copy.get("H", 0), errors="coerce").fillna(0)
         hr = pd.to_numeric(bat_copy.get("HR", 0), errors="coerce").fillna(0)
@@ -640,18 +640,18 @@ def add_projection_stats(roster_matched: pd.DataFrame, bat: pd.DataFrame, pit: p
     
     bat_idx = bat_copy.set_index("__CleanName", drop=False)
     
-    # Derive SVHD for pitchers
+    # Derive pitching stats if not already present
     pit_copy = pit.copy()
     if "K" not in pit_copy.columns and "SO" in pit_copy.columns:
         pit_copy["K"] = pit_copy["SO"]
-    sv = pd.to_numeric(pit_copy.get("SV", 0), errors="coerce").fillna(0)
-    hld = pd.to_numeric(pit_copy.get("HLD", pit_copy.get("HD", 0)), errors="coerce").fillna(0)
-    pit_copy["SVHD"] = 2 * sv + hld
-
-    # Derive K/BB for pitchers
-    p_k = pd.to_numeric(pit_copy.get("K", pit_copy.get("SO", 0)), errors="coerce").fillna(0)
-    p_bb = pd.to_numeric(pit_copy.get("BB", 0), errors="coerce").fillna(0)
-    pit_copy["K/BB"] = np.where(p_bb > 0, p_k / p_bb, np.nan)
+    if "SVHD" not in pit_copy.columns:
+        sv = pd.to_numeric(pit_copy.get("SV", 0), errors="coerce").fillna(0)
+        hld = pd.to_numeric(pit_copy.get("HLD", pit_copy.get("HD", 0)), errors="coerce").fillna(0)
+        pit_copy["SVHD"] = 2 * sv + hld
+    if "K/BB" not in pit_copy.columns:
+        p_k = pd.to_numeric(pit_copy.get("K", pit_copy.get("SO", 0)), errors="coerce").fillna(0)
+        p_bb = pd.to_numeric(pit_copy.get("BB", 0), errors="coerce").fillna(0)
+        pit_copy["K/BB"] = np.where(p_bb > 0, p_k / p_bb, np.nan)
 
     pit_idx = pit_copy.set_index("__CleanName", drop=False)
     
@@ -1435,6 +1435,20 @@ def main():
             min_pa = st.number_input("Min PA (hitter eligibility)", value=100, step=25, min_value=0)
             min_ip = st.number_input("Min IP (pitcher eligibility)", value=30.0, step=5.0, min_value=0.0)
             
+            st.divider()
+            st.markdown("##### Standings Mode")
+            include_bench = st.toggle(
+                "Include bench in category totals",
+                value=False,
+                help=(
+                    "When ON, category totals use all rostered players — not just "
+                    "the optimized starting lineup. Useful for counting stats "
+                    "like HLD and SV where relievers on your bench still contribute."
+                ),
+                key="include_bench_toggle",
+            )
+            
+            st.divider()
             st.markdown("##### Category Weights")
             weights: Dict[str, float] = {}
             for c in hit_cats + pit_cats:
@@ -1514,6 +1528,27 @@ def main():
     
     # Build projection index and match
     bat, pit = build_projection_index(bat_df, pit_df)
+
+    # Pre-derive computed stats on the projection DataFrames so ALL
+    # downstream consumers (add_projection_stats, two-way handling, etc.) see them.
+    if "TB" not in bat.columns and len(bat) > 0:
+        _h = pd.to_numeric(bat.get("H", 0), errors="coerce").fillna(0)
+        _hr = pd.to_numeric(bat.get("HR", 0), errors="coerce").fillna(0)
+        _2b = pd.to_numeric(bat.get("2B", bat.get("X2B", 0)), errors="coerce").fillna(0)
+        _3b = pd.to_numeric(bat.get("3B", bat.get("X3B", 0)), errors="coerce").fillna(0)
+        bat["TB"] = (_h - _2b - _3b - _hr) + 2 * _2b + 3 * _3b + 4 * _hr
+    if len(pit) > 0:
+        if "K" not in pit.columns and "SO" in pit.columns:
+            pit["K"] = pit["SO"]
+        if "SVHD" not in pit.columns:
+            _sv = pd.to_numeric(pit.get("SV", 0), errors="coerce").fillna(0)
+            _hld = pd.to_numeric(pit.get("HLD", pit.get("HD", 0)), errors="coerce").fillna(0)
+            pit["SVHD"] = 2 * _sv + _hld
+        if "K/BB" not in pit.columns:
+            _pk = pd.to_numeric(pit.get("K", pit.get("SO", 0)), errors="coerce").fillna(0)
+            _pbb = pd.to_numeric(pit.get("BB", 0), errors="coerce").fillna(0)
+            pit["K/BB"] = np.where(_pbb > 0, _pk / _pbb, np.nan)
+
     roster_matched = match_roster_to_projections(roster, bat, pit, threshold=match_threshold)
     
     # Apply any manual match overrides from session state
@@ -1641,7 +1676,9 @@ def main():
     col4.metric("Unmatched", int((~matched_ok | low_conf).sum()))
     
     # Calculate team totals and standings
-    team_totals_rows = []
+    team_totals_rows = []       # starters-only totals
+    team_totals_full_rows = []  # full-roster totals (starters + bench)
+    team_depth_rows = []        # bench depth scores
     lineups: Dict[str, Dict[str, pd.DataFrame]] = {}
     
     for t in teams:
@@ -1664,31 +1701,76 @@ def main():
         else:
             pit_assigned, _ = optimize_lineup(pitchers, "Value", pitcher_slots, bench_slots)
         
-        # Filter starters
+        # Filter starters vs bench
         if "Assigned_Slot" in hit_assigned.columns and len(hit_assigned) > 0:
             hit_starters = hit_assigned[hit_assigned["Assigned_Slot"].isin(hitter_slots)].copy()
+            hit_bench = hit_assigned[~hit_assigned["Assigned_Slot"].isin(hitter_slots)].copy()
         else:
             hit_starters = pd.DataFrame()
+            hit_bench = pd.DataFrame()
         
         if "Assigned_Slot" in pit_assigned.columns and len(pit_assigned) > 0:
             pit_starters = pit_assigned[pit_assigned["Assigned_Slot"].isin(pitcher_slots)].copy()
+            pit_bench = pit_assigned[~pit_assigned["Assigned_Slot"].isin(pitcher_slots)].copy()
         else:
             pit_starters = pd.DataFrame()
+            pit_bench = pd.DataFrame()
         
-        totals = team_totals_from_lineup(hit_starters, pit_starters, hit_cats, pit_cats)
-        totals["Team"] = t
-        team_totals_rows.append(totals)
+        # Starters-only totals
+        starter_totals = team_totals_from_lineup(hit_starters, pit_starters, hit_cats, pit_cats)
+        starter_totals["Team"] = t
+        team_totals_rows.append(starter_totals)
+        
+        # Full-roster totals (starters + bench)
+        full_totals = team_totals_from_lineup(hit_assigned, pit_assigned, hit_cats, pit_cats)
+        full_totals["Team"] = t
+        team_totals_full_rows.append(full_totals)
+        
+        # --- Depth score ---
+        hit_bench_val = float(hit_bench["Value"].sum()) if not hit_bench.empty and "Value" in hit_bench.columns else 0.0
+        pit_bench_val = float(pit_bench["Value"].sum()) if not pit_bench.empty and "Value" in pit_bench.columns else 0.0
+        starter_val = float(hit_starters["Value"].sum()) if not hit_starters.empty and "Value" in hit_starters.columns else 0.0
+        starter_val += float(pit_starters["Value"].sum()) if not pit_starters.empty and "Value" in pit_starters.columns else 0.0
+        bench_total = hit_bench_val + pit_bench_val
+        n_bench = (len(hit_bench) if not hit_bench.empty else 0) + (len(pit_bench) if not pit_bench.empty else 0)
+        
+        team_depth_rows.append({
+            "Team": t,
+            "Starter_Value": round(starter_val, 2),
+            "Bench_Value": round(bench_total, 2),
+            "Total_Value": round(starter_val + bench_total, 2),
+            "Bench_Hit_Value": round(hit_bench_val, 2),
+            "Bench_Pit_Value": round(pit_bench_val, 2),
+            "Bench_Count": n_bench,
+            "Bench_Avg": round(bench_total / n_bench, 2) if n_bench > 0 else 0.0,
+        })
         
         lineups[t] = {
             "hitters": hit_assigned,
             "pitchers": pit_assigned,
         }
     
-    team_totals = pd.DataFrame(team_totals_rows).set_index("Team")
+    # Build both totals DataFrames
+    team_totals_starters = pd.DataFrame(team_totals_rows).set_index("Team")
+    team_totals_full = pd.DataFrame(team_totals_full_rows).set_index("Team")
+    depth_df = pd.DataFrame(team_depth_rows).set_index("Team")
+    
+    # Choose which totals to use based on toggle
+    team_totals = team_totals_full if include_bench else team_totals_starters
+    
     cats = hit_cats + pit_cats
     team_scores = team_scores_from_totals(team_totals[cats], cats, weights)
     team_scores = team_scores.reset_index().rename(columns={"index": "Team"})
     team_scores = team_scores.sort_values("Team_Score", ascending=False).reset_index(drop=True)
+    
+    # Depth z-scores across the league
+    bench_val_mu = depth_df["Bench_Value"].mean()
+    bench_val_sd = depth_df["Bench_Value"].std()
+    if bench_val_sd > 0:
+        depth_df["Depth_Score"] = ((depth_df["Bench_Value"] - bench_val_mu) / bench_val_sd).round(2)
+    else:
+        depth_df["Depth_Score"] = 0.0
+    depth_df = depth_df.sort_values("Bench_Value", ascending=False)
     
     # Calculate team strengths for trade matching
     team_strengths = calculate_team_category_strength(team_totals, cats)
@@ -1705,7 +1787,10 @@ def main():
     
     with tab1:
         st.markdown("### Projected Rest-of-Season Standings")
-        st.caption("Based on optimized lineups • Roto scoring: 1st place = max points")
+        if include_bench:
+            st.caption("📦 **Full Roster mode** — totals include all rostered players (starters + bench)")
+        else:
+            st.caption("Based on optimized lineups • Roto scoring: 1st place = max points")
         
         # Roto standings
         n_teams = len(team_totals)
@@ -1767,6 +1852,42 @@ def main():
             use_container_width=True,
             height=750
         )
+        
+        # --- Depth Score Section ---
+        with st.expander("🪑 Bench Depth Rankings", expanded=False):
+            st.caption(
+                "Measures the quality of each team's bench. "
+                "**Bench Value** = sum of z-score weighted player values on the bench. "
+                "**Depth Score** = standard deviations above/below the league average bench."
+            )
+            
+            depth_display = depth_df[["Starter_Value", "Bench_Value", "Total_Value",
+                                      "Bench_Hit_Value", "Bench_Pit_Value",
+                                      "Bench_Count", "Bench_Avg", "Depth_Score"]].copy()
+            depth_display.insert(0, "Rank", range(1, len(depth_display) + 1))
+            
+            def _color_depth(val):
+                try:
+                    v = float(val)
+                    if v >= 1.0:
+                        return "background-color: #d4edda; color: #155724"
+                    elif v >= 0.3:
+                        return "background-color: #e8f5e9; color: #2e7d32"
+                    elif v <= -1.0:
+                        return "background-color: #f8d7da; color: #721c24"
+                    elif v <= -0.3:
+                        return "background-color: #fce4ec; color: #c62828"
+                except:
+                    pass
+                return ""
+            
+            st.dataframe(
+                depth_display.round(2).style.applymap(
+                    _color_depth, subset=["Depth_Score"]
+                ),
+                use_container_width=True,
+                height=min(500, 50 + 35 * len(teams)),
+            )
         
         with st.expander("📊 Raw Category Totals"):
             display_df = format_standings_table(team_scores, hit_cats, pit_cats)
