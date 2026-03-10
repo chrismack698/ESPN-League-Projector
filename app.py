@@ -43,6 +43,7 @@ PITCHING_PROJECTIONS = {
     "THE BAT": "thebat",
     "ATC": "atc",
     "OOPSY": "oopsy",
+    "THE BAT X": "thebatx"
 }
 
 # ESPN Eligible-Slot IDs for baseball (from espn-api package)
